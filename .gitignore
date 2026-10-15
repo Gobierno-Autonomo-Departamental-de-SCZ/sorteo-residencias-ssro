@@ -1,0 +1,17 @@
+.env
+.env.*
+postgres.env
+postgres.env.*
+node_modules/
+dist/
+backups/
+data/
+*.dump
+*.db
+*.sqlite*
+*.csv
+*.log
+*.pem
+*.key
+id_ed25519*
+test-output/
