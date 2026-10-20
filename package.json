@@ -6,7 +6,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/residencyServer.js",
-    "dev": "node --watch dist/residencyServer.js"
+    "dev": "node --watch dist/residencyServer.js",
+    "test": "npm run build && node --test test/*.cjs",
+    "migrate:security": "node scripts/migrate-security.cjs"
   },
   "dependencies": {
     "@types/pdfkit": "^0.17.6",
@@ -17,7 +19,7 @@
     "helmet": "^8.0.0",
     "pdfkit": "^0.20.2",
     "pg": "^8.23.1",
-    "xlsx": "^0.18.5",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
     "zod": "^3.24.2"
   },
   "devDependencies": {

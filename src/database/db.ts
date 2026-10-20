@@ -1,4 +1,6 @@
 import { Pool } from 'pg';
+import crypto from 'node:crypto';
+import {Session,SESSION_TTL_MS} from '../security/session.js';
 import {
   encryptPacked,
   decryptPacked,
@@ -65,6 +67,37 @@ export class EncryptedDatabase {
   }
   public async ready(): Promise<void> {
     await this.pool.query('SELECT id FROM sorteo_web.admin_users LIMIT 0');
+    await this.pool.query('SELECT token_hash FROM sorteo_web.admin_session LIMIT 0');
+    await this.pool.query('SELECT expires_at FROM sorteo_web.shared_result LIMIT 0');
+  }
+  public async createSession(username:string,password:string,entropyWords:string[]):Promise<{token:string;session:Session}|null> {
+    const admin=(await this.pool.query('SELECT id,username,password_hash FROM sorteo_web.admin_users WHERE username=$1',[username])).rows[0];
+    const hash=admin?.password_hash||'scrypt$16384$8$1$00000000000000000000000000000000$'+'0'.repeat(128);
+    if(!verifyPassword(password,hash)||!admin)return null;
+    const token=crypto.randomBytes(32).toString('hex');
+    const session:Session={username:admin.username,entropyWords,csrf:crypto.randomBytes(24).toString('hex'),expires:Date.now()+SESSION_TTL_MS};
+    const saved=await this.pool.query(`INSERT INTO sorteo_web.admin_session(token_hash,admin_id,password_hash_at_creation,payload_encrypted,expires_at)
+      SELECT $1,id,password_hash,$2,$3 FROM sorteo_web.admin_users WHERE id=$4 AND password_hash=$5 RETURNING token_hash`,
+      [crypto.createHash('sha256').update(token).digest('hex'),encryptPacked(JSON.stringify({entropyWords,csrf:session.csrf})),new Date(session.expires),admin.id,hash]);
+    return saved.rowCount?{token,session}:null;
+  }
+  public async session(token:unknown):Promise<Session|null> {
+    if(typeof token!=='string'||!/^[0-9a-f]{64}$/.test(token))return null;
+    const row=(await this.pool.query(`SELECT a.username,s.payload_encrypted,s.expires_at
+      FROM sorteo_web.admin_session s JOIN sorteo_web.admin_users a ON a.id=s.admin_id AND a.password_hash=s.password_hash_at_creation
+      WHERE s.token_hash=$1 AND s.expires_at>now()`,[crypto.createHash('sha256').update(token).digest('hex')])).rows[0];
+    if(!row)return null;
+    const payload=JSON.parse(decryptPacked(row.payload_encrypted));
+    return {username:row.username,entropyWords:payload.entropyWords,csrf:payload.csrf,expires:new Date(row.expires_at).getTime()};
+  }
+  public async revokeSession(token:unknown):Promise<void> {
+    if(typeof token!=='string'||!/^[0-9a-f]{64}$/.test(token))return;
+    await this.pool.query('DELETE FROM sorteo_web.admin_session WHERE token_hash=$1',[crypto.createHash('sha256').update(token).digest('hex')]);
+  }
+  public async pruneExpiredData():Promise<void> {
+    await this.pool.query(`DELETE FROM sorteo_web.admin_session s WHERE s.expires_at<=now()
+      OR NOT EXISTS(SELECT 1 FROM sorteo_web.admin_users a WHERE a.id=s.admin_id AND a.password_hash=s.password_hash_at_creation)`);
+    await this.pool.query("DELETE FROM sorteo_web.shared_result WHERE kind='SIMULATION' AND expires_at<=now()");
   }
   private db = {
     prepare: (sql: string) => {

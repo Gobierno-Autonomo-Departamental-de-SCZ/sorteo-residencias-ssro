@@ -1,25 +1,24 @@
-import {rememberSimulation,getSimulation,simulationCsv,simulationExcel,simulationPdf} from './services/simulationDownloads.js';
+import {createSimulationList,simulationCsv,simulationExcel,simulationPdf} from './services/simulationDownloads.js';
 import {sharedResultView} from './views/sharedResultView.js';
 import express,{Request,Response,NextFunction,RequestHandler} from 'express';
 import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
-import crypto from 'node:crypto';
 import path from 'node:path';
 import {ResidencyDatabase} from './database/residencyDb.js';
-import {encryptPacked,decryptPacked} from './crypto/cipher.js';
+import {Session,SESSION_TTL_MS} from './security/session.js';
 import {AdminLoginSchema} from './security/validation.js';
 import {isAllowedOrigin} from './security/requestOrigin.js';
 import {renderLoginView} from './views/loginView.js';
 import {preparationView,residencyResults,simulationResults,esc,publicMessage} from './views/preparationView.js';
 import {generateCsvExport,generateExcelExport,generatePdfExport} from './services/exportService.js';
 import {bridgeRequest,bridgeEnabled,sendPackage} from './services/sourceBridge.js';
-import {requiredEnv,bridgeConfig} from './config.js';
+import {requiredEnv,bridgeConfig,trustedProxies} from './config.js';
 
 export const db=new ResidencyDatabase();
 const app=express();
+app.set('trust proxy',trustedProxies());
 const cookieName='residency_session';
-type Session={username:string;entropyWords:string[];csrf:string;expires:number};
 const sessions=new WeakMap<Request,Session>();
 const shareUrl=(token:string)=>new URL('/s/'+token,requiredEnv('PUBLIC_ORIGIN')).href;
 const transfers=new Map<number,Promise<void>>();
@@ -39,7 +38,7 @@ app.use(express.urlencoded({extended:false,limit:'64kb'}));app.use(express.json(
 app.use(express.static(path.join(process.cwd(),'public')));
 app.get('/favicon.ico',(_req,res)=>res.redirect('/img/logo-santacruz.png?v=20261009'));
 app.use(rateLimit({windowMs:15*60*1000,limit:500}));
-app.use((req,res,next)=>{res.setHeader('Cache-Control','no-store');try{const s=JSON.parse(decryptPacked(req.cookies[cookieName])) as Session;if(s.expires>Date.now()&&s.csrf&&s.username)sessions.set(req,s);}catch{}next();});
+app.use((req,res,next)=>{res.setHeader('Cache-Control','no-store');void db.session(req.cookies[cookieName]).then(s=>{if(s)sessions.set(req,s);next();}).catch(next);});
 const auth:RequestHandler=(req,res,next)=>{if(!sessions.has(req)){res.redirect('/login');return;}next();};
 const csrf:RequestHandler=(req,res,next)=>{
  const s=sessions.get(req);
@@ -52,12 +51,12 @@ const csrf:RequestHandler=(req,res,next)=>{
 };
 app.get('/login',(_req,res)=>res.send(renderLoginView()));
 app.post('/login',rateLimit({windowMs:15*60*1000,limit:20}),wrap(async(req,res)=>{
- try{const p=AdminLoginSchema.parse(req.body);if(!await db.verifyAdmin(p.username,p.password)){res.status(401).send(renderLoginView('Credenciales incorrectas.'));return;}
- const s:Session={username:p.username,entropyWords:p.entropyWords,csrf:crypto.randomBytes(24).toString('hex'),expires:Date.now()+8*60*60*1000};
- res.cookie(cookieName,encryptPacked(JSON.stringify(s)),{httpOnly:true,sameSite:'strict',secure:process.env.COOKIE_SECURE==='true',maxAge:8*60*60*1000,path:'/'});res.redirect('/');
+ try{const p=AdminLoginSchema.parse(req.body);const created=await db.createSession(p.username,p.password,p.entropyWords);if(!created){res.status(401).send(renderLoginView('Credenciales incorrectas.'));return;}
+ await db.revokeSession(req.cookies[cookieName]);
+ res.cookie(cookieName,created.token,{httpOnly:true,sameSite:'strict',secure:process.env.COOKIE_SECURE==='true',maxAge:SESSION_TTL_MS,path:'/'});res.redirect('/');
  }catch{res.status(400).send(renderLoginView('Revise usuario, contraseña y las cinco palabras de inicio.'));}
 }));
-app.get('/logout',(_req,res)=>{res.clearCookie(cookieName);res.redirect('/login');});
+app.get('/logout',wrap(async(req,res)=>{await db.revokeSession(req.cookies[cookieName]);res.clearCookie(cookieName,{path:'/'});res.redirect('/login');}));
 app.get('/s/:token',wrap(async(req,res)=>{
  res.setHeader('X-Robots-Tag','noindex, nofollow, noarchive');
  res.setHeader('Referrer-Policy','no-referrer');
@@ -81,18 +80,18 @@ app.post('/draw',auth,csrf,wrap(async(req,res)=>{
  res.redirect('/results/'+r.id);
 }));
 app.post('/simulation',auth,csrf,wrap(async(req,res)=>{
- const list=rememberSimulation(await db.simulate(req.body.rule,sessions.get(req)!.entropyWords),sessions.get(req)!.csrf);
+ const list=createSimulationList(await db.simulate(req.body.rule,sessions.get(req)!.entropyWords));
  await db.saveSimulation(list,sessions.get(req)!.username);
  res.redirect('/simulation/'+list.id);
 }));
 app.get('/simulation/:id',auth,wrap(async(req,res)=>{
  const saved=await db.savedSimulation(String(req.params.id));
- const list=saved?.list||getSimulation(String(req.params.id),sessions.get(req)!.csrf);
+ const list=saved?.list;
  if(!list){res.status(404).send('<p>El resultado temporal venció o pertenece a otra sesión. Ejecute una nueva simulación.</p><a href="/">Volver</a>');return;}
  res.send(simulationResults(list,saved?shareUrl(saved.token):''));
 }));
 app.get('/simulation/:id/export/:format',auth,wrap(async(req,res)=>{
- const list=(await db.savedSimulation(String(req.params.id)))?.list||getSimulation(String(req.params.id),sessions.get(req)!.csrf);
+ const list=(await db.savedSimulation(String(req.params.id)))?.list;
  if(!list){res.status(404).send('Resultado temporal no disponible. Ejecute una nueva simulación.');return;}
  const name='simulacion-'+list.id;
  switch(req.params.format){
@@ -126,6 +125,9 @@ app.get('/results/:id/export/:format',auth,wrap(async(req,res)=>{
 app.get('/api/health',wrap(async(_req,res)=>{await db.ready();res.json({status:'OPERACIONAL',database:'PostgreSQL',mode:'residency-qmarasc'});}));
 app.use((_req,res)=>res.status(404).send('Ruta no disponible.'));
 app.use((error:Error,_req:Request,res:Response,_next:NextFunction)=>{res.status(400).send(`<p>${esc(publicMessage(error.message))}</p><a href="/">Volver al padrón</a>`);});
-export async function initialize(){requiredEnv('MASTER_KEY');requiredEnv('ADMIN_PASSWORD');requiredEnv('DATABASE_URL');requiredEnv('PUBLIC_ORIGIN');requiredEnv('SOURCE_FINGERPRINT_SQL');if(bridgeEnabled())bridgeConfig();await db.ready();try{await db.createAdmin(process.env.ADMIN_USER||'admin',process.env.ADMIN_PASSWORD!);}catch(e:any){if(!e.message.startsWith('AdminYaExiste:'))throw e;}}
-if(process.env.NODE_ENV!=='test')initialize().then(()=>app.listen(Number(process.env.PORT||3000),()=>console.log('Residencias: servidor iniciado'))).catch(e=>{console.error(e.message);process.exit(1);});
+export async function initialize(){requiredEnv('MASTER_KEY');requiredEnv('ADMIN_PASSWORD');requiredEnv('DATABASE_URL');requiredEnv('PUBLIC_ORIGIN');requiredEnv('SOURCE_FINGERPRINT_SQL');if(bridgeEnabled())bridgeConfig();await db.ready();await db.pruneExpiredData();try{await db.createAdmin(process.env.ADMIN_USER||'admin',process.env.ADMIN_PASSWORD!);}catch(e:any){if(!e.message.startsWith('AdminYaExiste:'))throw e;}}
+if(process.env.NODE_ENV!=='test')initialize().then(()=>{
+ const cleanup=setInterval(()=>{void db.pruneExpiredData().catch(()=>console.error('No se pudieron limpiar los datos temporales vencidos.'));},60*1000);cleanup.unref();
+ app.listen(Number(process.env.PORT||3000),()=>console.log('Residencias: servidor iniciado'));
+}).catch(e=>{console.error(e.message);process.exit(1);});
 export default app;

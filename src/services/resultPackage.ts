@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
-import {bridgeConfig} from '../config.js';
+
+export const resultDestination=(host?:string)=>({system:'qmarasc',...(host?{host}:{}),requiresSourceValidation:true,requiresAtomicIdempotentImport:true});
 
 // Stable across PostgreSQL jsonb key reordering and repeated downloads.
 export function canonical(value:any):string {
@@ -41,7 +42,7 @@ export function buildResultPackage(draw:any,input:any,seed:string){
    excludedByReview:excluded.length,eligibleBeforeReview:recipients.length+excluded.length,
    byCareer:draw.careerIds.map((id:number)=>({careerId:id,newAssignments:recipients.filter(r=>r.id_tipo_carrera===id&&r.incremento_cupo===1).length,
     preexistingAssignments:recipients.filter(r=>r.id_tipo_carrera===id&&r.incremento_cupo===0).length}))},
-  destination:{system:'qmarasc',host:bridgeConfig().host,requiresSourceValidation:true,requiresAtomicIdempotentImport:true}
+  destination:draw.destination||resultDestination()
  };
  return {...body,checksum:{algorithm:'SHA-256',canonicalization:'sorted-object-keys-json-v1',value:packageHash(body)}};
 }

@@ -1,5 +1,6 @@
 import {boliviaDate} from '../utils/boliviaDate.js';
 import { DrawHistoryRecord, ParticipantRecord } from '../database/db.js';
+import {sanitizeCSVCell} from '../security/validation.js';
 
 // En CommonJS, require está disponible en tiempo de ejecución
 declare const require: any;
@@ -29,7 +30,7 @@ export function generateCsvExport(draw: DrawHistoryRecord): string {
 
   const escapeCsv = (val: string | number | undefined | null) => {
     if (val === undefined || val === null) return '""';
-    const s = String(val).replace(/"/g, '""');
+    const s = sanitizeCSVCell(String(val)).replace(/"/g, '""');
     return `"${s}"`;
   };
 

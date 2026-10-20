@@ -4,9 +4,10 @@ import {SimulationList} from '../services/simulationDownloads.js';
 import {PoolClient} from 'pg';
 import {EncryptedDatabase,ParticipantRecord,HospitalRecord,DrawHistoryRecord} from './db.js';
 import {encryptPacked,decryptPacked} from '../crypto/cipher.js';
+import {sealSnapshot,openSnapshot} from '../crypto/snapshot.js';
 import {assign,ALGORITHM} from '../services/lottery.js';
 import {deriveHumanSeed,HUMAN_SEED_DERIVATION} from '../services/humanSeed.js';
-import {buildResultPackage,memoManifest} from '../services/resultPackage.js';
+import {buildResultPackage,memoManifest,resultDestination} from '../services/resultPackage.js';
 import {fingerprintSQL,requireSameFingerprint,bridgeEnabled} from '../services/sourceBridge.js';
 
 export interface Resident extends ParticipantRecord {
@@ -64,6 +65,8 @@ export class ResidencyDatabase extends EncryptedDatabase {
   const pending=raw.filter(p=>p.isActive&&p.status==='APROBADO'&&!p.hospitalId&&!excluded.has(p.id));
   const specials=raw.filter(p=>p.isActive&&p.status==='ASIGNADO'&&p.hospitalId);
   const errors:string[]=[];
+  if(raw.some(p=>p.isActive&&p.status==='APROBADO'&&p.hospitalId!==null))errors.push('Hay habilitaciones APROBADO con establecimiento asignado. Corrija su estado en el origen.');
+  if(raw.some(p=>p.isActive&&p.status==='ASIGNADO'&&p.hospitalId===null))errors.push('Hay habilitaciones ASIGNADO sin establecimiento. Corrija su estado en el origen.');
   const duplicateException=b.duplicate_exception;
   const exceptionApplies=duplicateException?.enabled===true
    &&duplicateException.periodId===b.period_id&&duplicateException.sedesId===b.sedes_id
@@ -87,6 +90,7 @@ export class ResidencyDatabase extends EncryptedDatabase {
   for(const summary of careerSummary)if(summary.pending>summary.available)errors.push('Cupos insuficientes en '+summary.name);
   const hash=digest({scope,sourceHash:b.source_hash,raw,hospitals,decisions,rule:b.rule,...(b.duplicate_exception?{duplicateException:b.duplicate_exception}:{})});
   const draw=(await c.query('SELECT id,snapshot FROM sorteo_web.draw_history WHERE batch_id=1')).rows[0];
+  if(draw)draw.snapshot=openSnapshot(draw.snapshot);
   return {batch:b,warnings,careerSummary,raw,pending:draw?[]:pending,specials:draw?draw.snapshot.specialCases as Resident[]:specials,hospitals,conflicts:draw?[]:conflicts,
    excluded:draw?raw.filter(p=>p.status==='APROBADO').map(p=>p.id):[...excluded],errors:draw?[]:errors,available,hash:draw?draw.snapshot.inputHash as string:hash,drawId:draw?.id as number|undefined,resultCount:draw?.snapshot.winners.length as number|undefined,
    confirmed:b.status==='CONFIRMADO'&&b.confirmed_hash===hash};
@@ -186,11 +190,11 @@ export class ResidencyDatabase extends EncryptedDatabase {
   const winners=assignments.map(a=>({...a.person,assignedHospital:a.slot.name,hospitalId:a.slot.hospitalId,quotaId:a.slot.quotaId,slot:a.slot.slot,rankPosition:a.rank}));
   const now=new Date().toISOString();
   const specialCases=x.specials.map(p=>({...p,quotaId:x.hospitals.find(h=>h.id===p.hospitalId&&h.careerId===p.careerId)!.quotaId}));
-   const snapshot={id:0,userWords:words,serverPhrase:'CSPRNG SHA-256: '+seedCommitment,weatherSnapshot:'No interviene en este sorteo',kSelectedCount:winners.length,hexBreakdown:[],hexSum:0,winners,specialCases,createdAt:now,algorithm:ALGORITHM,seedDerivation:HUMAN_SEED_DERIVATION,rule:x.batch.rule,inputHash:x.hash,actor,source:x.batch.source,sourceHash:x.batch.source_hash,periodId:x.batch.period_id,sedesId:x.batch.sedes_id,careerIds:x.batch.career_ids};
+   const snapshot={id:0,userWords:words,serverPhrase:'CSPRNG SHA-256: '+seedCommitment,weatherSnapshot:'No interviene en este sorteo',kSelectedCount:winners.length,hexBreakdown:[],hexSum:0,winners,specialCases,createdAt:now,algorithm:ALGORITHM,seedDerivation:HUMAN_SEED_DERIVATION,rule:x.batch.rule,inputHash:x.hash,actor,source:x.batch.source,sourceHash:x.batch.source_hash,periodId:x.batch.period_id,sedesId:x.batch.sedes_id,careerIds:x.batch.career_ids||[x.batch.career_id],destination:resultDestination(process.env.SSRO_BRIDGE_HOST?.trim())};
   memoManifest(snapshot); // Refuse an incomplete handoff before committing the draw.
   const input={participants:x.pending,specialCases,excludedIds:x.excluded,eliminatedIds:x.raw.filter(p=>p.status==='ELIMINADO').map(p=>p.id),quotaBaseline:x.hospitals,slots,rule:x.batch.rule,decisions:x.conflicts.map(g=>g.decision),...(x.batch.duplicate_exception?{duplicateException:x.batch.duplicate_exception}:{}),sourceHash:x.batch.source_hash,sourceFingerprint};
   const inserted=await c.query(`INSERT INTO sorteo_web.draw_history(user_words_encrypted,server_phrase_encrypted,weather_snapshot_encrypted,k_selected_count,hex_breakdown_encrypted,hex_sum,winners_ids_encrypted,special_cases_encrypted,created_at,batch_id,snapshot,input_snapshot,input_hash,seed_encrypted,algorithm,actor)
-   VALUES($1,$2,$3,$4,$5,0,$6,$7,$8,1,$9,$10,$11,$12,$13,$14) RETURNING id`,[encryptPacked(JSON.stringify(words)),encryptPacked(snapshot.serverPhrase),encryptPacked(snapshot.weatherSnapshot),winners.length,encryptPacked('[]'),encryptPacked(JSON.stringify(winners.map(w=>w.id))),encryptPacked(JSON.stringify(x.specials.map(p=>p.id))),now,JSON.stringify(snapshot),JSON.stringify(input),x.hash,encryptPacked(seed.toString('hex')),ALGORITHM,actor]);
+   VALUES($1,$2,$3,$4,$5,0,$6,$7,$8,1,$9,$10,$11,$12,$13,$14) RETURNING id`,[encryptPacked(JSON.stringify(words)),encryptPacked(snapshot.serverPhrase),encryptPacked(snapshot.weatherSnapshot),winners.length,encryptPacked('[]'),encryptPacked(JSON.stringify(winners.map(w=>w.id))),encryptPacked(JSON.stringify(x.specials.map(p=>p.id))),now,JSON.stringify(sealSnapshot(snapshot)),JSON.stringify(sealSnapshot(input)),x.hash,encryptPacked(seed.toString('hex')),ALGORITHM,actor]);
   snapshot.id=inserted.rows[0].id;
   const assigned=await c.query(`UPDATE public.habilitacion h SET fid_establecimiento_salud=w."hospitalId",estado_habilitacion='ASIGNADO',_fecha_modificacion=now()
    FROM jsonb_to_recordset($1::jsonb) AS w(id integer,"hospitalId" integer)
@@ -201,18 +205,19 @@ export class ResidencyDatabase extends EncryptedDatabase {
    FROM jsonb_to_recordset($1::jsonb) AS v(id integer,n integer)
    WHERE q.id_cupo_establecimiento_salud=v.id AND q.cupos-q.cupos_asignados>=v.n`,[JSON.stringify([...used].map(([id,n])=>({id,n})))]);
   if(quotas.rowCount!==used.size)throw Error('Los cupos cambiaron durante el sorteo.');
-  await c.query('UPDATE sorteo_web.draw_history SET snapshot=$1 WHERE id=$2',[JSON.stringify(snapshot),snapshot.id]);
+  await c.query('UPDATE sorteo_web.draw_history SET snapshot=$1 WHERE id=$2',[JSON.stringify(sealSnapshot(snapshot)),snapshot.id]);
   await c.query("INSERT INTO sorteo_web.transfer(draw_id,status) VALUES($1,'PENDING')",[snapshot.id]);
   await c.query("UPDATE sorteo_web.batch SET status='SORTEADO' WHERE id=1");
   await this.audit(c,'SORTEO',actor,{drawId:snapshot.id,inputHash:x.hash,seedCommitment,algorithm:ALGORITHM,count:winners.length});
   await createOfficialShareLink(c,snapshot.id,actor);
   return snapshot;
  });}
- public override async getDrawById(id:number):Promise<DrawHistoryRecord|null>{const row=(await this.pool.query('SELECT snapshot,annulled_at,annulment_reason FROM sorteo_web.draw_history WHERE id=$1',[id])).rows[0];return row?{...row.snapshot,...(row.annulled_at?{annulledAt:row.annulled_at,annulmentReason:row.annulment_reason}:{})}:null;}
+ public override async getDrawById(id:number):Promise<DrawHistoryRecord|null>{const row=(await this.pool.query('SELECT snapshot,annulled_at,annulment_reason FROM sorteo_web.draw_history WHERE id=$1',[id])).rows[0];return row?{...openSnapshot<DrawHistoryRecord>(row.snapshot),...(row.annulled_at?{annulledAt:row.annulled_at,annulmentReason:row.annulment_reason}:{})}:null;}
  public async exportPackage(id:number){
   const r=(await this.pool.query('SELECT snapshot,input_snapshot,seed_encrypted,algorithm,annulled_at FROM sorteo_web.draw_history WHERE id=$1',[id])).rows[0];
   if(!r)throw Error('Sorteo no encontrado.');
   if(r.annulled_at)throw Error('Este sorteo fue anulado y no puede enviarse ni utilizarse como resultado vigente.');
-  return buildResultPackage({...r.snapshot,algorithm:r.algorithm},r.input_snapshot,decryptPacked(r.seed_encrypted));
+  const snapshot=openSnapshot(r.snapshot);
+  return buildResultPackage({...snapshot,algorithm:r.algorithm,destination:snapshot.destination||resultDestination(process.env.SSRO_BRIDGE_HOST?.trim())},openSnapshot(r.input_snapshot),decryptPacked(r.seed_encrypted));
  }
 }

@@ -1,21 +1,18 @@
 import {boliviaDate} from '../utils/boliviaDate.js';
 import {randomInt,randomUUID} from 'node:crypto';
+import {sanitizeCSVCell} from '../security/validation.js';
 const XLSX=require('xlsx');
 const PDFDocument=require('pdfkit');
 export type SimulationList={id:string;createdAt:string;expires:number;people:any[]};
-const cache=new Map<string,{owner:string;list:SimulationList}>();
-function prune(){for(const [id,item] of cache)if(item.list.expires<=Date.now())cache.delete(id);}
-export function rememberSimulation(draw:any,owner:string):SimulationList {
- prune();while(cache.size>=50)cache.delete(cache.keys().next().value!);
+export function createSimulationList(draw:any):SimulationList {
  const people=[...draw.winners,...draw.specialCases].map(p=>({id:p.id,fullName:p.fullName,documentId:p.documentId,career:p.career,assignedHospital:p.assignedHospital||p.specialHospital}));
  for(let i=people.length-1;i>0;i--){const j=randomInt(i+1);[people[i],people[j]]=[people[j],people[i]];}
- const list={id:randomUUID(),createdAt:draw.createdAt,expires:Date.now()+60*60*1000,people};cache.set(list.id,{owner,list});return list;
+ return {id:randomUUID(),createdAt:draw.createdAt,expires:Date.now()+60*60*1000,people};
 }
-export function getSimulation(id:string,owner:string){prune();const item=cache.get(id);return item?.owner===owner?item.list:null;}
 const headers=['N°','Habilitación','Nombre','Documento','Carrera','Establecimiento'];
 function rows(list:SimulationList){return list.people.map((p,i)=>[i+1,p.id,p.fullName,p.documentId,p.career,p.assignedHospital]);}
 export function simulationCsv(list:SimulationList){
- const cell=(v:any)=>{let s=String(v??'');if(/^[=+@\-\t\r]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"';};
+ const cell=(v:any)=>'"'+sanitizeCSVCell(String(v??'')).replace(/"/g,'""')+'"';
  return '\uFEFF'+[headers,...rows(list)].map(r=>r.map(cell).join(',')).join('\r\n');
 }
 export function simulationExcel(list:SimulationList):Buffer {

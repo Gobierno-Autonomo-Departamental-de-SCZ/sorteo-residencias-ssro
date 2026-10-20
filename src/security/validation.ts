@@ -14,6 +14,7 @@ export const HumanEntropyWordsSchema = z.string({
   invalid_type_error: 'La entrada de entropía debe ser texto plano.',
 })
   .trim()
+  .max(254, 'Las cinco palabras no pueden superar 254 caracteres en total.')
   .refine(val => val.length > 0, {
     message: 'El campo de entropía no puede estar vacío.',
   })
@@ -24,8 +25,8 @@ export const HumanEntropyWordsSchema = z.string({
   .refine(words => words.length === 5, {
     message: 'Debe ingresar exactamente 5 palabras (separadas por espacios).',
   })
-  .refine(words => words.every(w => SINGLE_WORD_REGEX.test(w)), {
-    message: 'Cada una de las 5 palabras debe contener exclusivamente letras y un mínimo de 4 caracteres.',
+  .refine(words => words.every(w => w.length <= 50 && SINGLE_WORD_REGEX.test(w)), {
+    message: 'Cada una de las 5 palabras debe contener exclusivamente letras y entre 4 y 50 caracteres.',
   })
   .transform(words => words.map(w => w.toLowerCase()));
 

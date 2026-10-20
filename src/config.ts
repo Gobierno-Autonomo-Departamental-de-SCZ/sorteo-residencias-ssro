@@ -4,6 +4,14 @@ export function requiredEnv(name: string): string {
   return value;
 }
 
+/** Only known proxy addresses may supply the client IP; never trust arbitrary hops. */
+export function trustedProxies(value:string|undefined=process.env.TRUSTED_PROXIES):string[]|false {
+  if(value==='none')return false;
+  const proxies=(value??'loopback').split(',').map(v=>v.trim()).filter(Boolean);
+  if(!proxies.length||proxies.some(v=>/^(?:true|false|\d+)$/i.test(v)))throw Error('TRUSTED_PROXIES debe contener direcciones o redes de proxies de confianza, o none.');
+  return proxies;
+}
+
 export function bridgeConfig() {
   const host = requiredEnv('SSRO_BRIDGE_HOST');
   const user = requiredEnv('SSRO_BRIDGE_USER');
